@@ -1,0 +1,102 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function memberPath(fid, uid) { return /databases/$(database)/documents/families/$(fid)/members/$(uid); }
+    function isMember(fid) { return signedIn() && exists(memberPath(fid, request.auth.uid)); }
+    function isOwner(fid) { return isMember(fid) && get(memberPath(fid, request.auth.uid)).data.role == 'owner'; }
+
+    function validEvent(data, fid) {
+      return data.keys().hasAll(['title', 'time', 'ownerUid', 'ownerName', 'createdBy'])
+        && data.keys().hasOnly([
+          'title', 'day', 'date', 'time', 'teacher', 'place', 'notes',
+          'ownerUid', 'ownerName', 'off', 'updatedAt', 'createdBy', 'createdAt'
+        ])
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 100
+        && data.time is string && data.time.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && (('day' in data.keys() && data.day is int && data.day >= 0 && data.day <= 6)
+          || ('date' in data.keys() && data.date is string && data.date.size() == 10))
+        && data.ownerUid is string && exists(memberPath(fid, data.ownerUid))
+        && data.ownerName is string && data.ownerName.size() <= 60
+        && data.createdBy is string
+        && (!('teacher' in data.keys()) || (data.teacher is string && data.teacher.size() <= 80))
+        && (!('place' in data.keys()) || (data.place is string && data.place.size() <= 60))
+        && (!('notes' in data.keys()) || (data.notes is string && data.notes.size() <= 500))
+        && (!('off' in data.keys()) || (data.off is list && data.off.size() <= 100));
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list: if false;
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['displayName', 'email', 'familyId', 'createdAt'])
+        && request.resource.data.familyId == null;
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['familyId', 'displayName', 'email'])
+        && ((resource.data.familyId == null && request.resource.data.familyId is string
+              && existsAfter(memberPath(request.resource.data.familyId, uid)))
+          || (resource.data.familyId is string && request.resource.data.familyId == null
+              && !exists(memberPath(resource.data.familyId, uid)))
+          || request.resource.data.familyId == resource.data.familyId);
+      allow delete: if false;
+    }
+
+    match /families/{fid} {
+      allow get: if isMember(fid);
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'ownerUid', 'createdAt', 'app'])
+        && request.resource.data.name is string && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60;
+      allow update: if isOwner(fid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name']);
+      allow delete: if false;
+
+      match /members/{uid} {
+        allow get: if isOwner(fid) || (signedIn() && request.auth.uid == uid);
+        allow list: if isOwner(fid);
+        allow create: if (signedIn() && request.auth.uid == uid && request.resource.data.uid == uid
+            && request.resource.data.role == 'owner'
+            && request.resource.data.keys().hasOnly(['uid','displayName','email','role','familyName','joinedAt'])
+            && getAfter(/databases/$(database)/documents/families/$(fid)).data.ownerUid == uid)
+          || (signedIn() && request.auth.uid == uid && request.resource.data.uid == uid
+            && request.resource.data.role == 'member'
+            && request.resource.data.familyName is string && request.resource.data.familyName.size() <= 60
+            && request.resource.data.keys().hasOnly(['uid','displayName','email','role','familyName','joinedAt','inviteCode'])
+            && getAfter(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteCode)).data.familyId == fid
+            && getAfter(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteCode)).data.usedBy == uid
+            && getAfter(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteCode)).data.used == true
+            && getAfter(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteCode)).data.revoked == false
+            && getAfter(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteCode)).data.expiresAt > request.time);
+        allow update: if isOwner(fid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+        allow delete: if isOwner(fid) && uid != request.auth.uid;
+      }
+
+      match /events/{eventId} {
+        allow get, list: if isOwner(fid) || (isMember(fid) && resource.data.ownerUid == request.auth.uid);
+        allow create: if isMember(fid) && validEvent(request.resource.data, fid)
+          && (isOwner(fid) || request.resource.data.ownerUid == request.auth.uid)
+          && request.resource.data.createdBy == request.auth.uid;
+        allow update: if isMember(fid) && validEvent(request.resource.data, fid)
+          && (isOwner(fid) || (resource.data.ownerUid == request.auth.uid && request.resource.data.ownerUid == request.auth.uid));
+        allow delete: if isOwner(fid) || (isMember(fid) && resource.data.ownerUid == request.auth.uid);
+      }
+    }
+
+    match /familyInvites/{code} {
+      allow get: if signedIn() && resource.data.used == false && resource.data.revoked == false && resource.data.expiresAt > request.time;
+      allow list: if false;
+      allow create: if signedIn() && isOwner(request.resource.data.familyId)
+        && request.resource.data.keys().hasOnly(['familyId','familyName','createdBy','createdAt','expiresAt','used','revoked'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.familyName is string && request.resource.data.familyName.size() <= 60
+        && request.resource.data.used == false && request.resource.data.revoked == false
+        && request.resource.data.expiresAt is timestamp && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(48, 'h');
+      allow update: if signedIn() && resource.data.used == false && resource.data.revoked == false
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['used','usedBy'])
+        && request.resource.data.used == true && request.resource.data.usedBy == request.auth.uid
+        && existsAfter(memberPath(resource.data.familyId, request.auth.uid)) && resource.data.expiresAt > request.time;
+      allow delete: if isOwner(resource.data.familyId) && resource.data.used == false;
+    }
+  }
+}
